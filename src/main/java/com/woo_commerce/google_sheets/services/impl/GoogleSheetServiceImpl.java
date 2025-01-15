@@ -24,7 +24,6 @@ import com.google.api.services.sheets.v4.Sheets;
 import com.google.api.services.sheets.v4.SheetsScopes;
 import com.google.api.services.sheets.v4.model.AddSheetRequest;
 import com.google.api.services.sheets.v4.model.BatchUpdateSpreadsheetRequest;
-import com.google.api.services.sheets.v4.model.BatchUpdateSpreadsheetResponse;
 import com.google.api.services.sheets.v4.model.Request;
 import com.google.api.services.sheets.v4.model.Sheet;
 import com.google.api.services.sheets.v4.model.SheetProperties;
@@ -46,7 +45,7 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
     private static final JsonFactory JSON_FACTORY = GsonFactory.getDefaultInstance();
     private static final List<String> SCOPES = Collections.singletonList(SheetsScopes.SPREADSHEETS);
     private static List<Object> HEADERS = Arrays.asList("ID", "ITEM", "AMOUNT", "PRICE", "COST");
-    private static String RANGE = "Sheet1!A1:E1";
+    private static String RANGE = "%s!A1:E1";
     
     private final LoadingCache<String, Sheets> sheetsCache;
 
@@ -127,68 +126,42 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
             Sheets service = getSheetsService();
             verifySpreadsheetAccess(customerId);
 
-            Sheet sheet = getSheet(service, customerId, sheetName);
-
-            if(sheet.isEmpty()) {
-                addTitleToSheet(service);
-            } 
+            if(isSheetMissing(service, customerId, sheetName)) {
+                createSheet(service, customerId, sheetName);
+                addTitleToSheet(service, sheetName);
+            }
 
             addOrderToEnd(service, sheetName, request);
         }
-    
-        private Sheet getSheet(Sheets service, String spreadsheetId, String sheetName) throws IOException {
-            try {
-                Spreadsheet spreadsheet = service.spreadsheets().get(spreadsheetId).execute();
-                List<Sheet> sheets = spreadsheet.getSheets();
-                
-                return sheets.stream()
-                    .filter(sheet -> sheet.getProperties().getTitle().equals(sheetName))
-                    .findFirst()
-                    .orElseGet(() -> {
-                        try {
-                            return createSheet(service, spreadsheetId, sheetName);
-                        } catch (IOException e) {
-                            log.error("Error creating new sheet", e);
-                            throw new RuntimeException("Failed to create new sheet", e);
-                        }
-                    });
-            } catch (GoogleJsonResponseException e) {
-                log.error("Error getting sheet", e);
-                throw e;
-            }
+
+        private boolean isSheetMissing(Sheets service, String spreadsheetId, String sheetName) throws IOException {
+            Spreadsheet spreadsheet = service.spreadsheets()
+                .get(spreadsheetId)
+                .execute();
+            List<Sheet> sheets = spreadsheet.getSheets();
+
+            return sheets.stream()
+                .noneMatch(sheet -> sheet.getProperties().getTitle().equals(sheetName));
         }
-    
-        private Sheet createSheet(Sheets service, String spreadsheetId, String sheetName) throws IOException {
+
+        private void createSheet(Sheets service, String spreadsheetId, String sheetName) throws IOException {
             AddSheetRequest addSheetRequest = new AddSheetRequest()
                 .setProperties(new SheetProperties().setTitle(sheetName));
             Request request = new Request().setAddSheet(addSheetRequest);
             BatchUpdateSpreadsheetRequest batchUpdateRequest = new BatchUpdateSpreadsheetRequest()
                     .setRequests(Collections.singletonList(request));
     
-            try {
-                BatchUpdateSpreadsheetResponse response = service.spreadsheets()
-                    .batchUpdate(spreadsheetId, batchUpdateRequest)
-                    .execute();
-        
-                SheetProperties properties = response.getReplies()
-                    .get(0)
-                    .getAddSheet()
-                    .getProperties();
-            
-                return new Sheet()
-                    .setProperties(properties);
-            } catch (GoogleJsonResponseException e) {
-                log.error("Error creating sheet: {}", sheetName, e);
-                throw e;
-            }
+            service.spreadsheets()
+                .batchUpdate(spreadsheetId, batchUpdateRequest)
+                .execute();
         }
 
-        private void addTitleToSheet(Sheets service) throws IOException {
-            ValueRange body = new ValueRange().setValues(Arrays.asList(Arrays.asList(HEADERS)));
-
+        private void addTitleToSheet(Sheets service, String sheetName) throws IOException {
+            ValueRange body = new ValueRange()
+                .setValues(Collections.singletonList(HEADERS));
             try {
                 service.spreadsheets().values()
-                    .update(customerId, RANGE, body)
+                    .update(customerId, String.format(RANGE, sheetName), body)
                     .setValueInputOption("RAW")
                     .execute();
             } catch (GoogleJsonResponseException e) {
