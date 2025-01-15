@@ -2,6 +2,7 @@ package com.woo_commerce.google_sheets.controllers;
 
 import java.io.IOException;
 import java.security.GeneralSecurityException;
+import java.util.List;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -22,5 +23,10 @@ public class WebHookController {
     @PostMapping("/listening")
     public void listen(@RequestBody WebHookRequest request, @RequestHeader("userId") String userId) throws IOException, GeneralSecurityException {
         service.updateSheet(request, userId);
+    }
+
+    @PostMapping("/listening/many")
+    public void listen(@RequestBody List<WebHookRequest> requests, @RequestHeader("userId") String userId) throws IOException, GeneralSecurityException {
+        service.updateSheet(requests, userId);
     }
 }

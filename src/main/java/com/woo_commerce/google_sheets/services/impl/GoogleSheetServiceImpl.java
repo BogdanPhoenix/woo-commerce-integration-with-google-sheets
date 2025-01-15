@@ -54,6 +54,20 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
 
     @Override
     public void updateSheet(WebHookRequest request, String userId) {
+        List<List<Object>> buffer = Collections.singletonList(request.getSheetRow());
+        executeForCustomer(buffer, userId);
+    }
+
+    @Override
+    public void updateSheet(List<WebHookRequest> requests, String userId) {
+        List<List<Object>> buffer = requests.stream()
+            .map(r -> r.getSheetRow())
+            .toList();
+        
+        executeForCustomer(buffer, userId);
+    }
+
+    private void executeForCustomer(List<List<Object>> requests, String userId) {
         try {
             verifySpreadsheetAccess(config.getCustomersId());
 
@@ -61,7 +75,7 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
                 .forSheet(userId)
                 .createSheetIfMissing()
                 .withHeaders(HEADERS)
-                .withValues(Collections.singletonList(request.getSheetRow()))
+                .withValues(requests)
                 .execute();
 
         } catch (Exception e) {
