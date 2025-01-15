@@ -1,27 +1,25 @@
 package com.woo_commerce.google_sheets.services.impl;
 
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
+import com.google.api.client.auth.oauth2.BearerToken;
 import com.google.api.client.auth.oauth2.Credential;
-import com.google.api.client.extensions.java6.auth.oauth2.AuthorizationCodeInstalledApp;
-import com.google.api.client.extensions.jetty.auth.oauth2.LocalServerReceiver;
-import com.google.api.client.googleapis.auth.oauth2.GoogleAuthorizationCodeFlow;
-import com.google.api.client.googleapis.auth.oauth2.GoogleClientSecrets;
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
+import com.google.api.client.googleapis.json.GoogleJsonResponseException;
 import com.google.api.client.http.javanet.NetHttpTransport;
 import com.google.api.client.json.JsonFactory;
 import com.google.api.client.json.gson.GsonFactory;
-import com.google.api.client.util.store.FileDataStoreFactory;
 import com.google.api.services.sheets.v4.Sheets;
 import com.google.api.services.sheets.v4.SheetsScopes;
 import com.google.api.services.sheets.v4.model.AddSheetRequest;
@@ -32,17 +30,25 @@ import com.google.api.services.sheets.v4.model.Sheet;
 import com.google.api.services.sheets.v4.model.SheetProperties;
 import com.google.api.services.sheets.v4.model.Spreadsheet;
 import com.google.api.services.sheets.v4.model.ValueRange;
+import com.google.auth.oauth2.GoogleCredentials;
 import com.woo_commerce.google_sheets.dto.WebHookRequest;
 import com.woo_commerce.google_sheets.services.GoogleSheetService;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+
+import lombok.extern.slf4j.Slf4j;
+import javax.annotation.Nonnull;
 
 @Service
+@Slf4j
 public class GoogleSheetServiceImpl implements GoogleSheetService {
     private static final JsonFactory JSON_FACTORY = GsonFactory.getDefaultInstance();
     private static final List<String> SCOPES = Collections.singletonList(SheetsScopes.SPREADSHEETS);
-    private static final String TOKENS_DIRECTORY_PATH = "tokens";
-    private static final int PORT = 8888;
     private static List<Object> HEADERS = Arrays.asList("ID", "ITEM", "AMOUNT", "PRICE", "COST");
     private static String RANGE = "Sheet1!A1:E1";
+    
+    private final LoadingCache<String, Sheets> sheetsCache;
 
     @Value("${google.project.name}")
     private String applicationName;
@@ -56,51 +62,71 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
     @Value("${google.project.table.customers.id}")
     private String customerId;
 
+    public GoogleSheetServiceImpl() {
+        this.sheetsCache = CacheBuilder.newBuilder()
+                .expireAfterWrite(1, TimeUnit.HOURS)
+                .build(new CacheLoader<String, Sheets>() {
+                    @Override
+                    public Sheets load(@Nonnull String key) throws Exception {
+                        return createSheetsService();
+                    }
+                });
+    }
+
     @Override
     public void updateSheet(WebHookRequest request, String userId) throws IOException, GeneralSecurityException {
         CustomerSheet customerSheet = new CustomerSheet();
-
         customerSheet.updateSheet(userId, request);
     }
 
-
-    private Sheets getSheetsService() throws IOException, GeneralSecurityException {
+    private Sheets createSheetsService() throws IOException, GeneralSecurityException {
         final NetHttpTransport HTTP_TRANSPORT = GoogleNetHttpTransport.newTrustedTransport();
-        
         return new Sheets.Builder(HTTP_TRANSPORT, JSON_FACTORY, getCredentials(HTTP_TRANSPORT))
                 .setApplicationName(applicationName)
                 .build();
     }
 
-    /**
-     * Creates an authorized Credential object.
-     *
-     * @param HTTP_TRANSPORT The network HTTP Transport.
-     * @return An authorized Credential object.
-     * @throws IOException If the credentials.json file cannot be found.
-     */
-    private Credential getCredentials(final NetHttpTransport HTTP_TRANSPORT) throws IOException {
-        InputStream in = GoogleSheetServiceImpl.class.getResourceAsStream(credentialsFilePath);
-        
-        if (in == null) {
-            throw new FileNotFoundException("Resource not found: " + credentialsFilePath);
-        
+    private Sheets getSheetsService() throws IOException, GeneralSecurityException {
+        try {
+            return sheetsCache.get("sheets");
+        } catch (ExecutionException e) {
+            log.error("Error getting sheets service from cache", e);
+            throw new IOException("Failed to get sheets service", e);
         }
-        GoogleClientSecrets clientSecrets = GoogleClientSecrets.load(JSON_FACTORY, new InputStreamReader(in));
+    }
 
-        GoogleAuthorizationCodeFlow flow = new GoogleAuthorizationCodeFlow.Builder(
-            HTTP_TRANSPORT, JSON_FACTORY, clientSecrets, SCOPES)
-            .setDataStoreFactory(new FileDataStoreFactory(new java.io.File(TOKENS_DIRECTORY_PATH)))
-            .setAccessType("offline")
-            .build();
+    private Credential getCredentials(final NetHttpTransport HTTP_TRANSPORT) throws IOException {
+        InputStream in = new ClassPathResource(credentialsFilePath).getInputStream();
+        try {
+            GoogleCredentials credentials = GoogleCredentials.fromStream(in)
+                    .createScoped(SCOPES);
+            credentials.refreshIfExpired();
+            
+            return new Credential(BearerToken.authorizationHeaderAccessMethod())
+                .setAccessToken(credentials.getAccessToken().getTokenValue());
+        } finally {
+            in.close();
+        }
+    }
 
-        LocalServerReceiver receiver = new LocalServerReceiver.Builder().setPort(PORT).build();
-        return new AuthorizationCodeInstalledApp(flow, receiver).authorize("user");
+    private void verifySpreadsheetAccess(String spreadsheetId) throws IOException {
+        try {
+            getSheetsService().spreadsheets().get(spreadsheetId).execute();
+        } catch (GoogleJsonResponseException e) {
+            if (e.getStatusCode() == 403) {
+                throw new SecurityException("Service account doesn't have access to spreadsheet: " + spreadsheetId);
+            }
+            throw e;
+        } catch (GeneralSecurityException e) {
+            throw new IOException("Failed to verify spreadsheet access", e);
+        }
     }
 
     private class CustomerSheet {
         private void updateSheet(String sheetName, WebHookRequest request) throws IOException, GeneralSecurityException {
             Sheets service = getSheetsService();
+            verifySpreadsheetAccess(customerId);
+
             Sheet sheet = getSheet(service, customerId, sheetName);
 
             if(sheet.isEmpty()) {
@@ -111,13 +137,25 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
         }
     
         private Sheet getSheet(Sheets service, String spreadsheetId, String sheetName) throws IOException {
-            Spreadsheet spreadsheet = service.spreadsheets().get(spreadsheetId).execute();
-            List<Sheet> sheets = spreadsheet.getSheets();
-            
-            return sheets.stream()
-                .filter(sheet -> sheet.getProperties().getTitle().equals(sheetName))
-                .findFirst()
-                .orElse(createSheet(service, spreadsheetId, sheetName));
+            try {
+                Spreadsheet spreadsheet = service.spreadsheets().get(spreadsheetId).execute();
+                List<Sheet> sheets = spreadsheet.getSheets();
+                
+                return sheets.stream()
+                    .filter(sheet -> sheet.getProperties().getTitle().equals(sheetName))
+                    .findFirst()
+                    .orElseGet(() -> {
+                        try {
+                            return createSheet(service, spreadsheetId, sheetName);
+                        } catch (IOException e) {
+                            log.error("Error creating new sheet", e);
+                            throw new RuntimeException("Failed to create new sheet", e);
+                        }
+                    });
+            } catch (GoogleJsonResponseException e) {
+                log.error("Error getting sheet", e);
+                throw e;
+            }
         }
     
         private Sheet createSheet(Sheets service, String spreadsheetId, String sheetName) throws IOException {
@@ -127,36 +165,50 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
             BatchUpdateSpreadsheetRequest batchUpdateRequest = new BatchUpdateSpreadsheetRequest()
                     .setRequests(Collections.singletonList(request));
     
-            BatchUpdateSpreadsheetResponse response = service.spreadsheets()
-                .batchUpdate(spreadsheetId, batchUpdateRequest)
-                .execute();
-    
-            SheetProperties properties = response.getReplies()
-                .get(0)
-                .getAddSheet()
-                .getProperties();
+            try {
+                BatchUpdateSpreadsheetResponse response = service.spreadsheets()
+                    .batchUpdate(spreadsheetId, batchUpdateRequest)
+                    .execute();
         
-            return new Sheet()
-                .setProperties(properties);
+                SheetProperties properties = response.getReplies()
+                    .get(0)
+                    .getAddSheet()
+                    .getProperties();
+            
+                return new Sheet()
+                    .setProperties(properties);
+            } catch (GoogleJsonResponseException e) {
+                log.error("Error creating sheet: {}", sheetName, e);
+                throw e;
+            }
         }
 
-        private void addTitleToSheet(Sheets service) throws IOException{
+        private void addTitleToSheet(Sheets service) throws IOException {
             ValueRange body = new ValueRange().setValues(Arrays.asList(Arrays.asList(HEADERS)));
 
-            service.spreadsheets().values()
-                .update(customerId, RANGE, body)
-                .setValueInputOption("RAW")
-                .execute();
+            try {
+                service.spreadsheets().values()
+                    .update(customerId, RANGE, body)
+                    .setValueInputOption("RAW")
+                    .execute();
+            } catch (GoogleJsonResponseException e) {
+                log.error("Error adding title to sheet", e);
+                throw e;
+            }
         }
 
         private void addOrderToEnd(Sheets service, String sheetName, WebHookRequest request) throws IOException {
             ValueRange body = new ValueRange().setValues(Arrays.asList(request.getSheetRow()));
-            service.spreadsheets().values()
-                .append(customerId, sheetName, body)
-                .setValueInputOption("RAW")
-                .setInsertDataOption("INSERT_ROWS")
-                .execute();
+            try {
+                service.spreadsheets().values()
+                    .append(customerId, sheetName, body)
+                    .setValueInputOption("RAW")
+                    .setInsertDataOption("INSERT_ROWS")
+                    .execute();
+            } catch (GoogleJsonResponseException e) {
+                log.error("Error adding order to sheet", e);
+                throw e;
+            }
         }
     }
-    
 }
