@@ -3,6 +3,7 @@ package com.woo_commerce.google_sheets.services.impl;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 import com.google.api.services.sheets.v4.Sheets;
 import com.google.api.services.sheets.v4.model.AddSheetRequest;
@@ -15,6 +16,7 @@ import com.google.api.services.sheets.v4.model.ValueRange;
 
 import lombok.extern.slf4j.Slf4j;
 import com.woo_commerce.google_sheets.exception.GoogleSheetException;
+import com.woo_commerce.google_sheets.exception.GoogleSheetException.ErrorCode;
 
 @Slf4j
 public class SheetOperationBuilder {
@@ -24,7 +26,6 @@ public class SheetOperationBuilder {
     private final List<Request> requests = new ArrayList<>();
     private final String spreadsheetId;
     private final Sheets service;
-
 
     private String sheetName;
     private List<List<Object>> values;
@@ -41,15 +42,13 @@ public class SheetOperationBuilder {
         return this;
     }
 
-    public SheetOperationBuilder createSheetIfMissing() {
-        try {
-            this.needsNewSheet = isSheetMissing();
-            if (needsNewSheet) {
-                requests.add(createSheetRequest());
-            }
-        } catch (IOException e) {
-            throw new GoogleSheetException("Failed to check sheet existence", e);
+    public SheetOperationBuilder createSheetIfMissing() throws GoogleSheetException {
+        this.needsNewSheet = isSheetMissing();
+        
+        if (needsNewSheet) {
+            requests.add(createSheetRequest());
         }
+        
         return this;
     }
 
@@ -57,6 +56,7 @@ public class SheetOperationBuilder {
         if (needsNewSheet) {
             this.values.add(headers);
         }
+
         return this;
     }
 
@@ -65,14 +65,18 @@ public class SheetOperationBuilder {
         return this;
     }
 
-    private boolean isSheetMissing() throws IOException {
-        Spreadsheet spreadsheet = service.spreadsheets()
-            .get(spreadsheetId)
-            .execute();
+    private boolean isSheetMissing() throws GoogleSheetException {
+        try {
+            Spreadsheet spreadsheet = service.spreadsheets()
+                .get(spreadsheetId)
+                .execute();
 
-        return spreadsheet.getSheets()
-            .stream()
-            .noneMatch(sheet -> sheet.getProperties().getTitle().equals(sheetName));
+            return spreadsheet.getSheets()
+                .stream()
+                .noneMatch(sheet -> sheet.getProperties().getTitle().equals(sheetName));
+        } catch (IOException e) {
+            throw new GoogleSheetException(ErrorCode.SHEET_NOT_FOUND, "Worksheet could not be found by the specified ID: " + spreadsheetId, e);
+        }
     }
 
     private Request createSheetRequest() {
@@ -87,35 +91,67 @@ public class SheetOperationBuilder {
             .setAddSheet(new AddSheetRequest().setProperties(properties));
     }
 
-    public void execute() {
+    public void execute() throws GoogleSheetException {
         try {
-            if (!requests.isEmpty()) {
+            executeBatchUpdates()
+                .thenCompose(v -> executeValueUpdates())
+                .join();
+        } catch (Exception e) {
+            throw new GoogleSheetException(ErrorCode.OPERATION_FAILED, "Failed to execute sheet operations", e);
+        }
+    }
+
+    private CompletableFuture<Void> executeBatchUpdates() {
+        if (requests.isEmpty()) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        return CompletableFuture.runAsync(() -> {
+            try {
                 BatchUpdateSpreadsheetRequest batchUpdate = new BatchUpdateSpreadsheetRequest()
                     .setRequests(requests);
 
                 service.spreadsheets()
                     .batchUpdate(spreadsheetId, batchUpdate)
                     .execute();
+            } catch (IOException e) {
+                throw new GoogleSheetException(ErrorCode.OPERATION_FAILED, "Failed to execute batch update operations", e);
             }
+        });
+    }
 
-            if (values != null && !values.isEmpty()) {
-                ValueRange body = new ValueRange().setValues(values);
-
-                if (needsNewSheet) {
-                    service.spreadsheets().values()
-                        .update(spreadsheetId, String.format("%s!A1", sheetName), body)
-                        .setValueInputOption("RAW")
-                        .execute();
-                } else {
-                    service.spreadsheets().values()
-                        .append(spreadsheetId, sheetName, body)
-                        .setValueInputOption("RAW")
-                        .setInsertDataOption("INSERT_ROWS")
-                        .execute();
-                }
-            }
-        } catch (IOException e) {
-            throw new GoogleSheetException("Failed to execute sheet operations", e);
+    private CompletableFuture<Void> executeValueUpdates() {
+        if (values == null || values.isEmpty()) {
+            return CompletableFuture.completedFuture(null);
         }
+
+        return CompletableFuture.runAsync(() -> {
+            try {
+                ValueRange body = new ValueRange().setValues(values);
+                
+                if (needsNewSheet) {
+                    updateNewSheet(body);
+                } else {
+                    appendToExistingSheet(body);
+                }
+            } catch (IOException e) {
+                throw new GoogleSheetException(ErrorCode.OPERATION_FAILED, "Failed to update sheet values", e);
+            }
+        });
+    }
+
+    private void updateNewSheet(ValueRange body) throws IOException {
+        service.spreadsheets().values()
+            .update(spreadsheetId, String.format("%s!A1", sheetName), body)
+            .setValueInputOption("RAW")
+            .execute();
+    }
+
+    private void appendToExistingSheet(ValueRange body) throws IOException {
+        service.spreadsheets().values()
+            .append(spreadsheetId, sheetName, body)
+            .setValueInputOption("RAW")
+            .setInsertDataOption("INSERT_ROWS")
+            .execute();
     }
 } 

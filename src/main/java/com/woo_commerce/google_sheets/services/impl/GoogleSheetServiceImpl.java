@@ -25,6 +25,7 @@ import com.google.api.services.sheets.v4.SheetsScopes;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.woo_commerce.google_sheets.dto.WebHookRequest;
 import com.woo_commerce.google_sheets.exception.GoogleSheetException;
+import com.woo_commerce.google_sheets.exception.GoogleSheetException.ErrorCode;
 import com.woo_commerce.google_sheets.services.GoogleSheetService;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
@@ -46,20 +47,20 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
     private final Sheets service;
 
     @Autowired
-    public GoogleSheetServiceImpl(GoogleSheetConfig config) throws IOException {
+    public GoogleSheetServiceImpl(GoogleSheetConfig config) throws GoogleSheetException {
         this.config = config;
         this.sheetsCache = createSheetsCache();
         this.service = getSheetsService();
     }
 
     @Override
-    public void updateSheet(WebHookRequest request, String userId) {
+    public void updateSheet(WebHookRequest request, String userId) throws GoogleSheetException {
         List<List<Object>> buffer = Collections.singletonList(request.getSheetRow());
         executeForCustomer(buffer, userId);
     }
 
     @Override
-    public void updateSheet(List<WebHookRequest> requests, String userId) {
+    public void updateSheet(List<WebHookRequest> requests, String userId) throws GoogleSheetException {
         List<List<Object>> buffer = requests.stream()
             .map(r -> r.getSheetRow())
             .toList();
@@ -67,7 +68,7 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
         executeForCustomer(buffer, userId);
     }
 
-    private void executeForCustomer(List<List<Object>> requests, String userId) {
+    private void executeForCustomer(List<List<Object>> requests, String userId) throws GoogleSheetException {
         try {
             verifySpreadsheetAccess(config.getCustomersId());
 
@@ -78,43 +79,52 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
                 .withValues(requests)
                 .execute();
 
-        } catch (Exception e) {
+        } catch (GoogleSheetException e) {
             log.error("Failed to update sheet for user: {}", userId, e);
-            throw new GoogleSheetException("Failed to update sheet", e);
+            throw new GoogleSheetException(ErrorCode.OPERATION_FAILED, "Failed to update sheet for user: " + userId, e);
         }
     }
 
-    private Sheets createSheetsService() throws IOException, GeneralSecurityException {
-        final NetHttpTransport HTTP_TRANSPORT = GoogleNetHttpTransport.newTrustedTransport();
-        return new Sheets.Builder(HTTP_TRANSPORT, JSON_FACTORY, getCredentials(HTTP_TRANSPORT))
-                .setApplicationName(config.getApplicationName())
-                .build();
+    private Sheets createSheetsService() throws GoogleSheetException {
+        try {
+            final NetHttpTransport HTTP_TRANSPORT = GoogleNetHttpTransport.newTrustedTransport();
+            return new Sheets.Builder(HTTP_TRANSPORT, JSON_FACTORY, getCredentials(HTTP_TRANSPORT))
+                    .setApplicationName(config.getApplicationName())
+                    .build();
+        } catch (IOException e) {
+            throw new GoogleSheetException(ErrorCode.AUTHENTICATION_FAILED, "Failed to create Google Sheets service: " + e.getMessage(), e);
+        } catch (GeneralSecurityException e) {
+            throw new GoogleSheetException(ErrorCode.AUTHENTICATION_FAILED, "Security error while creating Google Sheets service: " + e.getMessage(), e);
+        }
     }
 
-    private Sheets getSheetsService() throws IOException {
+    private Sheets getSheetsService() throws GoogleSheetException {
         try {
             return sheetsCache.get("sheets");
         } catch (ExecutionException e) {
             log.error("Error getting sheets service from cache", e);
-            throw new IOException("Failed to get sheets service", e);
+            throw new GoogleSheetException(ErrorCode.SERVICE_UNAVAILABLE, "Failed to get Google Sheets service: " + e.getMessage(), e);
         }
     }
 
-    private Credential getCredentials(final NetHttpTransport HTTP_TRANSPORT) throws IOException {
-        InputStream in = new ClassPathResource(config.getCredentialsFilePath()).getInputStream();
-        try {
+    private Credential getCredentials(final NetHttpTransport HTTP_TRANSPORT) throws GoogleSheetException {
+        try (InputStream in = new ClassPathResource(config.getCredentialsFilePath()).getInputStream()) {
+            if (in == null) {
+                throw new GoogleSheetException(ErrorCode.AUTHENTICATION_FAILED, "Credentials file not found at path: " + config.getCredentialsFilePath());
+            }
+
             GoogleCredentials credentials = GoogleCredentials.fromStream(in)
                     .createScoped(SCOPES);
             credentials.refreshIfExpired();
             
             return new Credential(BearerToken.authorizationHeaderAccessMethod())
                 .setAccessToken(credentials.getAccessToken().getTokenValue());
-        } finally {
-            in.close();
+        } catch (IOException e) {
+            throw new GoogleSheetException(ErrorCode.AUTHENTICATION_FAILED, "Failed to load Google Sheets credentials: " + e.getMessage(), e);
         }
     }
 
-    private void verifySpreadsheetAccess(String spreadsheetId) throws IOException {
+    private void verifySpreadsheetAccess(String spreadsheetId) throws GoogleSheetException {
         try {
             this.service
                 .spreadsheets()
@@ -122,10 +132,16 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
                 .execute();
 
         } catch (GoogleJsonResponseException e) {
-            if (e.getStatusCode() == 403) {
-                throw new SecurityException("Service account doesn't have access to spreadsheet: " + spreadsheetId);
+            switch (e.getStatusCode()) {
+                case 403:
+                    throw new GoogleSheetException(ErrorCode.PERMISSION_DENIED, "Service account doesn't have access to spreadsheet: " + spreadsheetId, e);
+                case 404:
+                    throw new GoogleSheetException(ErrorCode.SHEET_NOT_FOUND, "Spreadsheet not found: " + spreadsheetId, e);
+                default:
+                    throw new GoogleSheetException(ErrorCode.SERVICE_UNAVAILABLE, "Google Sheets API error: " + e.getMessage(), e);
             }
-            throw e;
+        } catch (IOException e) {
+            throw new GoogleSheetException(ErrorCode.SERVICE_UNAVAILABLE, "Failed to verify spreadsheet access", e);
         }
     }
 
@@ -134,7 +150,7 @@ public class GoogleSheetServiceImpl implements GoogleSheetService {
                 .expireAfterWrite(1, TimeUnit.HOURS)
                 .build(new CacheLoader<String, Sheets>() {
                     @Override
-                    public Sheets load(@Nonnull String key) throws Exception {
+                    public Sheets load(@Nonnull String key) throws GoogleSheetException {
                         return createSheetsService();
                     }
                 });
